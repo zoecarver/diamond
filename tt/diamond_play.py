@@ -191,19 +191,19 @@ def tt_group_norm(x, num_groups, device):
     N = seq_tiles * TILE * TILE
 
     cache_key = (hw, channels)
-    if cache_key in _gn_cache:
-        scaler, mean_scale = _gn_cache[cache_key]
-    else:
+    if cache_key not in _gn_cache:
         scaler = ttnn.from_torch(
             torch.ones(TILE, TILE, dtype=torch.bfloat16),
             ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=L1)
         mean_scale = ttnn.from_torch(
             torch.full((TILE, TILE), 1.0 / N, dtype=torch.bfloat16),
             ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=L1)
-        _gn_cache[cache_key] = (scaler, mean_scale)
+        out_2d = ttnn.from_torch(
+            torch.zeros(hw, channels, dtype=torch.bfloat16),
+            ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
+        _gn_cache[cache_key] = (scaler, mean_scale, out_2d)
 
-    out_2d = ttnn.from_torch(torch.zeros(hw, channels, dtype=torch.bfloat16),
-                             ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
+    scaler, mean_scale, out_2d = _gn_cache[cache_key]
     groupnorm_2g(x_2d, scaler, mean_scale, out_2d)
     return ttnn.reshape(out_2d, shape)
 
@@ -365,18 +365,11 @@ def unet_forward(x, sd, device, batch, h, w, conv_config, compute_config):
 
 _norm_out_cache = {}  # "w"/"b" -> device tensor
 
-def inner_model_forward(noisy_next_obs, c_noise, obs, act, sd, device,
-                        batch, num_actions, conv_config, compute_config):
-    cond_host = compute_conditioning(c_noise, act, sd, num_actions)
 
-    # Batch-precompute all AdaGroupNorm scale/shift and send to device
-    precompute_adaln_params(cond_host, sd, device)
-
-    cat_input = torch.cat((obs, noisy_next_obs), dim=1)
-    cat_nhwc = cat_input.permute(0, 2, 3, 1).contiguous()
-    x_host = tt_host(cat_nhwc.to(torch.bfloat16))
-
-    x, h, w = tt_conv2d(x_host, device,
+def model_device_forward(input_tt, sd, device, batch, conv_config, compute_config):
+    """Pure device forward: conv_in -> UNet -> norm_out -> conv_out.
+    All inputs must be on device. No host I/O. Traceable."""
+    x, h, w = tt_conv2d(input_tt, device,
                           in_ch=15, out_ch=CHANNELS[0], batch=batch,
                           h=IMG_SIZE, w=IMG_SIZE,
                           conv_config=conv_config, compute_config=compute_config,
@@ -384,7 +377,6 @@ def inner_model_forward(noisy_next_obs, c_noise, obs, act, sd, device,
 
     x, h, w = unet_forward(x, sd, device, batch, h, w, conv_config, compute_config)
 
-    # norm_out with weight/bias (cached in L1)
     ng = max(1, CHANNELS[0] // GN_GROUP_SIZE)
     x = tt_group_norm(x, ng, device)
     if "w" not in _norm_out_cache:
@@ -408,16 +400,35 @@ def inner_model_forward(noisy_next_obs, c_noise, obs, act, sd, device,
     return x, oh, ow
 
 
+def prepare_input_and_run(noisy_next_obs, c_noise, obs, act, sd, device,
+                          batch, num_actions, conv_config, compute_config,
+                          input_buf=None, trace_id=None):
+    """Host-side prep (conditioning, adaln, input copy) + device forward.
+    If trace_id is set, replays trace instead of running ops."""
+    cond_host = compute_conditioning(c_noise, act, sd, num_actions)
+    precompute_adaln_params(cond_host, sd, device)
+
+    cat_input = torch.cat((obs, noisy_next_obs), dim=1)
+    cat_nhwc = cat_input.permute(0, 2, 3, 1).contiguous().to(torch.bfloat16)
+    cat_host = ttnn.from_torch(cat_nhwc, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    if trace_id is not None:
+        ttnn.copy_host_to_device_tensor(cat_host, input_buf)
+        ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+    else:
+        x_host = tt_host(cat_nhwc)
+        return model_device_forward(x_host, sd, device, batch, conv_config, compute_config)
+
+
 def sample_next_frame(prev_obs, prev_act, sd, device, num_actions,
-                      conv_config, compute_config):
-    """Full diffusion sampling loop. The 3 denoise steps + precondition + Euler
-    all run on device. Only the conditioning MLP + AdaGroupNorm linear stay on host."""
+                      conv_config, compute_config, trace_id=None,
+                      input_buf=None, output_buf=None):
+    """Diffusion sampling loop. If trace_id is provided, uses traced execution."""
     b = prev_obs.shape[0]
     sigmas = build_sigmas()
     obs_flat = prev_obs.reshape(b, -1, IMG_SIZE, IMG_SIZE).float()
     rescaled_obs = (obs_flat / SIGMA_DATA).to(torch.bfloat16)
 
-    # Start with random noise on host, will move to device
     x_host = torch.randn(b, IMG_CH, IMG_SIZE, IMG_SIZE).to(torch.bfloat16)
 
     for i in range(len(sigmas) - 1):
@@ -426,46 +437,45 @@ def sample_next_frame(prev_obs, prev_act, sd, device, num_actions,
 
         sigma = sigmas[i]
         c_in, c_out, c_skip, c_noise = compute_conditioners(sigma.unsqueeze(0))
-
-        # Rescale noisy input on host, send to device via inner_model_forward
         rescaled_noise = (x_host.float() * c_in[:, None, None, None]).to(torch.bfloat16)
 
-        # Run UNet on device (conditioning + adaln precomputed on host, sent to device)
-        model_out_tt, oh, ow = inner_model_forward(
-            rescaled_noise, c_noise, rescaled_obs, prev_act,
-            sd, device, b, num_actions, conv_config, compute_config)
+        if trace_id is not None:
+            prepare_input_and_run(
+                rescaled_noise, c_noise, rescaled_obs, prev_act,
+                sd, device, b, num_actions, conv_config, compute_config,
+                input_buf=input_buf, trace_id=trace_id)
+            model_out_tt = output_buf
+            oh, ow = IMG_SIZE, IMG_SIZE
+        else:
+            model_out_tt, oh, ow = prepare_input_and_run(
+                rescaled_noise, c_noise, rescaled_obs, prev_act,
+                sd, device, b, num_actions, conv_config, compute_config)
 
-        # --- Precondition on device ---
-        # Send x_host to device in NHWC format matching model output [1, 1, H*W, C]
+        # Precondition on device
         x_nhwc = x_host.permute(0, 2, 3, 1).contiguous().reshape(1, 1, oh * ow, IMG_CH)
         x_tt = tt_dev(x_nhwc, device)
 
-        # denoised = c_skip * x + c_out * model_out (on device, scalar broadcast)
         denoised_tt = ttnn.add(
             ttnn.multiply(x_tt, c_skip.item()),
             ttnn.multiply(model_out_tt, c_out.item()))
-        ttnn.deallocate(model_out_tt)
+        if trace_id is None:
+            ttnn.deallocate(model_out_tt)
 
-        # Quantize on device: clamp to [-1, 1]
         denoised_tt = ttnn.clip(denoised_tt, -1.0, 1.0)
 
-        # --- Euler step on device ---
+        # Euler step on device
         if i < len(sigmas) - 2:
             dt = sigmas[i + 1] - sigmas[i]
             dt_over_sigma = (dt / sigma).item()
-            # x_new = x + dt_over_sigma * (x - denoised)
             diff_tt = ttnn.subtract(x_tt, denoised_tt)
             x_new_tt = ttnn.add(x_tt, ttnn.multiply(diff_tt, dt_over_sigma))
             ttnn.deallocate(diff_tt)
             ttnn.deallocate(denoised_tt)
             ttnn.deallocate(x_tt)
-
-            # Read back x for next step's host-side input preparation
             x_raw = ttnn.to_torch(x_new_tt)
             ttnn.deallocate(x_new_tt)
             x_host = x_raw.reshape(b, oh, ow, -1)[:, :, :, :IMG_CH].permute(0, 3, 1, 2).to(torch.bfloat16)
         else:
-            # Last step: denoised is the final output
             ttnn.deallocate(x_tt)
             x_raw = ttnn.to_torch(denoised_tt)
             ttnn.deallocate(denoised_tt)
@@ -493,7 +503,8 @@ def main():
     print(f"  {len(sd)} params, {num_actions} actions")
 
     print("\n[2/5] Opening device...")
-    device = ttnn.open_device(device_id=0, l1_small_size=32768)
+    device = ttnn.open_device(device_id=0, l1_small_size=32768,
+                               trace_region_size=200_000_000)
     print(f"  Grid: {device.compute_with_storage_grid_size()}")
 
     conv_config = ttnn.Conv2dConfig(
@@ -516,7 +527,7 @@ def main():
         Image.fromarray(frame, "RGB").save(f"/tmp/diamond_init_{i}.png")
     print(f"  Saved initial frames to /tmp/diamond_init_*.png")
 
-    print(f"\n[4/5] Warmup pass (populates weight caches)...")
+    print(f"\n[4/7] Warmup pass (populates weight caches, compiles ops)...")
     B = 1
     t_warmup = time.time()
     _ = sample_next_frame(prev_obs, prev_act, sd, device,
@@ -525,9 +536,29 @@ def main():
     print(f"  Cached {len(_conv_weight_cache)} conv weights, {len(_gn_cache)} GN helpers, "
           f"{len(_norm_out_cache)} norm_out params")
 
-    print(f"\n[5/6] Generating frames (autoregressive, {NUM_DENOISE_STEPS} denoise steps each)...")
+    # --- Capture trace of model_device_forward ---
+    print(f"\n[5/7] Capturing trace...")
+    # Pre-allocate persistent input buffer on DRAM
+    dummy_input = torch.randn(B, IMG_SIZE, IMG_SIZE, 15, dtype=torch.bfloat16)
+    input_buf = ttnn.from_torch(dummy_input, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                                 device=device, memory_config=DRAM)
+    # Pre-populate adaln params for trace capture
+    sigmas = build_sigmas()
+    c_in, c_out, c_skip, c_noise = compute_conditioners(sigmas[0].unsqueeze(0))
+    cond_host = compute_conditioning(c_noise, prev_act, sd, num_actions)
+    precompute_adaln_params(cond_host, sd, device)
+
+    # Capture: pure device ops from conv_in through conv_out
+    trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+    output_buf, _, _ = model_device_forward(
+        input_buf, sd, device, B, conv_config, compute_config)
+    ttnn.end_trace_capture(device, trace_id, cq_id=0)
+    ttnn.synchronize_device(device)
+    print(f"  Trace captured (id={trace_id})")
+
+    print(f"\n[6/7] Generating frames (traced, autoregressive, {NUM_DENOISE_STEPS} denoise steps each)...")
     NUM_GEN_FRAMES = 8
-    all_frames = [prev_obs[0, i] for i in range(NUM_COND)]  # collect all frames
+    all_frames = [prev_obs[0, i] for i in range(NUM_COND)]
     obs_buffer = prev_obs.clone()
     act_buffer = prev_act.clone()
 
@@ -536,7 +567,9 @@ def main():
         print(f"\n  Frame {frame_idx + 1}/{NUM_GEN_FRAMES}:", flush=True)
 
         next_frame = sample_next_frame(obs_buffer, act_buffer, sd, device,
-                                        num_actions, conv_config, compute_config)
+                                        num_actions, conv_config, compute_config,
+                                        trace_id=trace_id, input_buf=input_buf,
+                                        output_buf=output_buf)
 
         # Shift obs buffer: drop oldest, append new
         obs_buffer = torch.cat([obs_buffer[:, 1:], next_frame.float().unsqueeze(1)], dim=1)
@@ -548,7 +581,7 @@ def main():
         elapsed = time.time() - t0
         print(f"    Total: {elapsed*1000:.0f}ms, range: [{next_frame.min():.2f}, {next_frame.max():.2f}]")
 
-    print(f"\n[6/6] Saving frames...")
+    print(f"\n[7/7] Saving frames...")
     for i, frame in enumerate(all_frames):
         img = frame.add(1).div(2).clamp(0, 1).mul(255).byte()
         img = img.permute(1, 2, 0).cpu().numpy()
