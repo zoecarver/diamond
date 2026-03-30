@@ -1,0 +1,484 @@
+"""
+Diamond world model inference with synthetic Breakout-like initial frames.
+
+Generates 4 initial conditioning frames resembling Breakout (black bg, colored
+bricks, paddle, ball), then runs the diffusion model autoregressively to
+predict future frames.
+"""
+import math
+import time
+import sys
+import torch
+import torch.nn.functional as F
+import ttnn
+import numpy as np
+
+sys.path.insert(0, "/tmp")
+from kernels import groupnorm_2g
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SIGMA_DATA = 0.5
+SIGMA_OFFSET_NOISE = 0.3
+NUM_COND = 4
+IMG_CH = 3
+COND_CH = 256
+CHANNELS = [64, 64, 64, 64]
+DEPTHS = [2, 2, 2, 2]
+GN_EPS = 1e-5
+GN_GROUP_SIZE = 32
+IMG_SIZE = 64
+NUM_DENOISE_STEPS = 3
+SIGMA_MIN = 2e-3
+SIGMA_MAX = 5.0
+RHO = 7
+DRAM = ttnn.DRAM_MEMORY_CONFIG
+TILE = 32
+
+
+# ---------------------------------------------------------------------------
+# Create synthetic Breakout frames
+# ---------------------------------------------------------------------------
+
+def make_breakout_frame(ball_y=50, ball_x=32, paddle_x=28):
+    """Create a simple Breakout-like 64x64 RGB frame in [-1, 1]."""
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    # Bricks (rows 8-20, colored)
+    colors = [
+        (200, 50, 50),   # red
+        (200, 150, 50),  # orange
+        (50, 200, 50),   # green
+        (50, 50, 200),   # blue
+    ]
+    for i, color in enumerate(colors):
+        y = 8 + i * 3
+        for bx in range(0, 64, 10):
+            img[y:y+2, bx:bx+8] = color
+
+    # Ball (small white square)
+    by, bx = int(ball_y), int(ball_x)
+    img[max(0, by-1):by+2, max(0, bx-1):bx+2] = (255, 255, 255)
+
+    # Paddle (white bar at bottom)
+    px = int(paddle_x)
+    img[60:62, max(0, px):min(64, px+8)] = (200, 200, 200)
+
+    # Score area (dark gray top)
+    img[0:6, :] = (40, 40, 40)
+
+    # Convert to [-1, 1] float tensor [C, H, W]
+    t = torch.from_numpy(img).float().div(255).mul(2).sub(1)
+    return t.permute(2, 0, 1)  # [3, 64, 64]
+
+
+def make_initial_frames():
+    """Create 4 conditioning frames with slight ball movement."""
+    frames = []
+    for i in range(NUM_COND):
+        ball_y = 45 - i * 3
+        ball_x = 30 + i * 2
+        frames.append(make_breakout_frame(ball_y, ball_x, paddle_x=28))
+    return torch.stack(frames).unsqueeze(0)  # [1, 4, 3, 64, 64]
+
+
+# ---------------------------------------------------------------------------
+# Weight loading
+# ---------------------------------------------------------------------------
+
+def download_weights(game="Breakout"):
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(repo_id="eloialonso/diamond",
+                           filename=f"atari_100k/models/{game}.pt")
+
+
+def load_denoiser_sd(path):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    prefix = "denoiser."
+    return {k[len(prefix):]: v.float() for k, v in ckpt.items() if k.startswith(prefix)}
+
+
+# ---------------------------------------------------------------------------
+# Host-side helpers
+# ---------------------------------------------------------------------------
+
+def fourier_features(sigma, weight):
+    f = 2 * math.pi * sigma.unsqueeze(1) @ weight
+    return torch.cat([f.cos(), f.sin()], dim=-1)
+
+
+def compute_conditioning(sigma, prev_act, sd, num_actions):
+    b = sigma.shape[0]
+    noise_emb = fourier_features(sigma, sd["inner_model.noise_emb.weight"])
+    act_emb = sd["inner_model.act_emb.0.weight"][prev_act.long()].reshape(b, -1)
+    combined = noise_emb + act_emb
+    cond = F.linear(combined, sd["inner_model.cond_proj.0.weight"],
+                     sd["inner_model.cond_proj.0.bias"])
+    cond = F.silu(cond)
+    cond = F.linear(cond, sd["inner_model.cond_proj.2.weight"],
+                     sd["inner_model.cond_proj.2.bias"])
+    return cond
+
+
+def compute_conditioners(sigma):
+    sigma_adj = (sigma**2 + SIGMA_OFFSET_NOISE**2).sqrt()
+    c_in = 1 / (sigma_adj**2 + SIGMA_DATA**2).sqrt()
+    c_skip = SIGMA_DATA**2 / (sigma_adj**2 + SIGMA_DATA**2)
+    c_out = sigma_adj * c_skip.sqrt()
+    c_noise = sigma_adj.log() / 4
+    return c_in, c_out, c_skip, c_noise
+
+
+def build_sigmas():
+    min_inv_rho = SIGMA_MIN ** (1 / RHO)
+    max_inv_rho = SIGMA_MAX ** (1 / RHO)
+    l = torch.linspace(0, 1, NUM_DENOISE_STEPS)
+    sigmas = (max_inv_rho + l * (min_inv_rho - max_inv_rho)) ** RHO
+    return torch.cat((sigmas, sigmas.new_zeros(1)))
+
+
+# ---------------------------------------------------------------------------
+# TTNN helpers
+# ---------------------------------------------------------------------------
+
+def tt_host(t, dtype=ttnn.bfloat16):
+    return ttnn.from_torch(t, dtype)
+
+
+def tt_dev(t, device, layout=ttnn.TILE_LAYOUT, mem=DRAM):
+    return ttnn.from_torch(t.to(torch.bfloat16), ttnn.bfloat16, layout=layout,
+                           device=device, memory_config=mem)
+
+
+def tt_conv2d(x, w_tt, b_tt, device, in_ch, out_ch, batch, h, w,
+              kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
+              conv_config=None, compute_config=None):
+    [out, [oh, ow], _] = ttnn.conv2d(
+        input_tensor=x, weight_tensor=w_tt, in_channels=in_ch,
+        out_channels=out_ch, device=device, bias_tensor=b_tt,
+        kernel_size=kernel_size, stride=stride, padding=padding,
+        dilation=(1, 1), batch_size=batch, input_height=h, input_width=w,
+        conv_config=conv_config, compute_config=compute_config,
+        groups=1, return_output_dim=True, return_weights_and_bias=True)
+    return out, oh, ow
+
+
+def tt_group_norm(x, num_groups, device):
+    shape = x.shape
+    hw = shape[2] if len(shape) == 4 else shape[0]
+    channels = shape[3] if len(shape) == 4 else shape[1]
+    x_2d = ttnn.reshape(x, [hw, channels])
+    seq_tiles = hw // TILE
+    N = seq_tiles * TILE * TILE
+    scaler = ttnn.from_torch(torch.ones(TILE, TILE, dtype=torch.bfloat16),
+                             ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
+    mean_scale = ttnn.from_torch(torch.full((TILE, TILE), 1.0 / N, dtype=torch.bfloat16),
+                                 ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
+    out_2d = ttnn.from_torch(torch.zeros(hw, channels, dtype=torch.bfloat16),
+                             ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
+    groupnorm_2g(x_2d, scaler, mean_scale, out_2d)
+    ttnn.deallocate(scaler)
+    ttnn.deallocate(mean_scale)
+    return ttnn.reshape(out_2d, shape)
+
+
+# ---------------------------------------------------------------------------
+# AdaGroupNorm + ResBlock + UNet (same as diamond_tt.py)
+# ---------------------------------------------------------------------------
+
+def ada_group_norm(x, cond_host, linear_w, linear_b, in_ch, num_groups, device, batch):
+    normed = tt_group_norm(x, num_groups, device)
+    scale_shift = F.linear(cond_host, linear_w, linear_b)
+    scale, shift = scale_shift.chunk(2, dim=-1)
+    scale_4d = scale.unsqueeze(1).unsqueeze(1).to(torch.bfloat16)
+    shift_4d = shift.unsqueeze(1).unsqueeze(1).to(torch.bfloat16)
+    scale_tt = tt_dev(scale_4d, device)
+    shift_tt = tt_dev(shift_4d, device)
+    one_plus_scale = ttnn.add(scale_tt, 1.0)
+    modulated = ttnn.multiply(normed, one_plus_scale)
+    out = ttnn.add(modulated, shift_tt)
+    ttnn.deallocate(normed)
+    ttnn.deallocate(scale_tt)
+    ttnn.deallocate(shift_tt)
+    ttnn.deallocate(one_plus_scale)
+    ttnn.deallocate(modulated)
+    return out
+
+
+def resblock(x, cond_host, sd, prefix, device, in_ch, out_ch, batch, h, w,
+             conv_config, compute_config):
+    ng_in = max(1, in_ch // GN_GROUP_SIZE)
+    ng_out = max(1, out_ch // GN_GROUP_SIZE)
+    should_proj = (in_ch != out_ch)
+
+    if should_proj:
+        proj_w = tt_host(sd[f"{prefix}.proj.weight"])
+        proj_b = tt_host(sd[f"{prefix}.proj.bias"].reshape(1, 1, 1, -1))
+        r, _, _ = tt_conv2d(x, proj_w, proj_b, device, in_ch, out_ch,
+                             batch, h, w, kernel_size=(1, 1), padding=(0, 0),
+                             conv_config=conv_config, compute_config=compute_config)
+    else:
+        r = x
+
+    h1 = ada_group_norm(x, cond_host, sd[f"{prefix}.norm1.linear.weight"],
+                         sd[f"{prefix}.norm1.linear.bias"], in_ch, ng_in, device, batch)
+    h1 = ttnn.silu(h1)
+    conv1_w = tt_host(sd[f"{prefix}.conv1.weight"])
+    conv1_b = tt_host(sd[f"{prefix}.conv1.bias"].reshape(1, 1, 1, -1))
+    h1, _, _ = tt_conv2d(h1, conv1_w, conv1_b, device, in_ch, out_ch,
+                          batch, h, w, conv_config=conv_config, compute_config=compute_config)
+
+    h2 = ada_group_norm(h1, cond_host, sd[f"{prefix}.norm2.linear.weight"],
+                         sd[f"{prefix}.norm2.linear.bias"], out_ch, ng_out, device, batch)
+    ttnn.deallocate(h1)
+    h2 = ttnn.silu(h2)
+    conv2_w = tt_host(sd[f"{prefix}.conv2.weight"])
+    conv2_b = tt_host(sd[f"{prefix}.conv2.bias"].reshape(1, 1, 1, -1))
+    h2, _, _ = tt_conv2d(h2, conv2_w, conv2_b, device, out_ch, out_ch,
+                          batch, h, w, conv_config=conv_config, compute_config=compute_config)
+
+    out = ttnn.add(h2, r)
+    ttnn.deallocate(h2)
+    if should_proj:
+        ttnn.deallocate(r)
+    return out
+
+
+def unet_forward(x, cond_host, sd, device, batch, h, w, conv_config, compute_config):
+    num_levels = len(CHANNELS)
+    d_outputs = []
+    cur_h, cur_w = h, w
+
+    for level in range(num_levels):
+        c1 = CHANNELS[max(0, level - 1)]
+        c2 = CHANNELS[level]
+        if level == 0:
+            x_down = x
+        else:
+            ds_w = tt_host(sd[f"inner_model.unet.downsamples.{level}.conv.weight"])
+            ds_b = tt_host(sd[f"inner_model.unet.downsamples.{level}.conv.bias"].reshape(1, 1, 1, -1))
+            x_down, cur_h, cur_w = tt_conv2d(
+                x, ds_w, ds_b, device, c1, c1, batch, cur_h, cur_w,
+                stride=(2, 2), conv_config=conv_config, compute_config=compute_config)
+
+        block_outputs = [x_down]
+        x_cur = x_down
+        for bi in range(DEPTHS[level]):
+            in_ch = c1 if bi == 0 else c2
+            prefix = f"inner_model.unet.d_blocks.{level}.resblocks.{bi}"
+            x_cur = resblock(x_cur, cond_host, sd, prefix, device,
+                              in_ch, c2, batch, cur_h, cur_w, conv_config, compute_config)
+            block_outputs.append(x_cur)
+        d_outputs.append(block_outputs)
+        x = x_cur
+
+    mid_h, mid_w = cur_h, cur_w
+    c_mid = CHANNELS[-1]
+    for bi in range(2):
+        prefix = f"inner_model.unet.mid_blocks.resblocks.{bi}"
+        x = resblock(x, cond_host, sd, prefix, device,
+                      c_mid, c_mid, batch, mid_h, mid_w, conv_config, compute_config)
+
+    for dec_idx in range(num_levels):
+        level = num_levels - 1 - dec_idx
+        c1 = CHANNELS[max(0, level - 1)]
+        c2 = CHANNELS[level]
+        if dec_idx == 0:
+            x_up = x
+        else:
+            x_rm = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+            x_4d = ttnn.reshape(x_rm, [batch, cur_h, cur_w, c2])
+            ttnn.deallocate(x_rm)
+            x_up_raw = ttnn.upsample(x_4d, scale_factor=2, mode="nearest")
+            ttnn.deallocate(x_4d)
+            new_h = cur_h * 2
+            new_w = cur_w * 2
+            up_idx = dec_idx
+            up_ch = CHANNELS[level]
+            up_w = tt_host(sd[f"inner_model.unet.upsamples.{up_idx}.conv.weight"])
+            up_b = tt_host(sd[f"inner_model.unet.upsamples.{up_idx}.conv.bias"].reshape(1, 1, 1, -1))
+            x_up, cur_h, cur_w = tt_conv2d(
+                x_up_raw, up_w, up_b, device, up_ch, up_ch, batch, new_h, new_w,
+                conv_config=conv_config, compute_config=compute_config)
+            ttnn.deallocate(x_up_raw)
+
+        skip = d_outputs[level][::-1]
+        u_idx = num_levels - 1 - level
+        n_dec_blocks = DEPTHS[level] + 1
+        x_cur = x_up
+        for bi in range(n_dec_blocks):
+            x_cur = ttnn.concat([x_cur, skip[bi]], dim=-1)
+            cat_ch = c2 * 2 if bi < DEPTHS[level] else c1 + c2
+            out_ch = c2 if bi < DEPTHS[level] else c1
+            prefix = f"inner_model.unet.u_blocks.{u_idx}.resblocks.{bi}"
+            x_cur = resblock(x_cur, cond_host, sd, prefix, device,
+                              cat_ch, out_ch, batch, cur_h, cur_w, conv_config, compute_config)
+        x = x_cur
+
+    return x, cur_h, cur_w
+
+
+def inner_model_forward(noisy_next_obs, c_noise, obs, act, sd, device,
+                        batch, num_actions, conv_config, compute_config):
+    cond_host = compute_conditioning(c_noise, act, sd, num_actions)
+    cat_input = torch.cat((obs, noisy_next_obs), dim=1)
+    cat_nhwc = cat_input.permute(0, 2, 3, 1).contiguous()
+    x_host = tt_host(cat_nhwc.to(torch.bfloat16))
+
+    conv_in_w = tt_host(sd["inner_model.conv_in.weight"])
+    conv_in_b = tt_host(sd["inner_model.conv_in.bias"].reshape(1, 1, 1, -1))
+    x, h, w = tt_conv2d(x_host, conv_in_w, conv_in_b, device,
+                          in_ch=15, out_ch=CHANNELS[0], batch=batch,
+                          h=IMG_SIZE, w=IMG_SIZE,
+                          conv_config=conv_config, compute_config=compute_config)
+
+    x, h, w = unet_forward(x, cond_host, sd, device, batch, h, w, conv_config, compute_config)
+
+    # norm_out with weight/bias
+    ng = max(1, CHANNELS[0] // GN_GROUP_SIZE)
+    x = tt_group_norm(x, ng, device)
+    gn_w = ttnn.from_torch(
+        sd["inner_model.norm_out.norm.weight"].to(torch.bfloat16).reshape(1, 1, 1, -1),
+        ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device, memory_config=DRAM)
+    gn_b = ttnn.from_torch(
+        sd["inner_model.norm_out.norm.bias"].to(torch.bfloat16).reshape(1, 1, 1, -1),
+        ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device, memory_config=DRAM)
+    gn_w = ttnn.to_layout(gn_w, ttnn.TILE_LAYOUT)
+    gn_b = ttnn.to_layout(gn_b, ttnn.TILE_LAYOUT)
+    x = ttnn.multiply(x, gn_w)
+    x = ttnn.add(x, gn_b)
+    x = ttnn.silu(x)
+
+    conv_out_w = tt_host(sd["inner_model.conv_out.weight"])
+    conv_out_b = tt_host(sd["inner_model.conv_out.bias"].reshape(1, 1, 1, -1))
+    x, oh, ow = tt_conv2d(x, conv_out_w, conv_out_b, device,
+                            in_ch=CHANNELS[0], out_ch=IMG_CH, batch=batch,
+                            h=h, w=w, conv_config=conv_config, compute_config=compute_config)
+    return x, oh, ow
+
+
+def denoise_step(noisy_next_obs, sigma, obs, act, sd, device, batch,
+                 num_actions, conv_config, compute_config):
+    c_in, c_out, c_skip, c_noise = compute_conditioners(sigma)
+    rescaled_obs = obs / SIGMA_DATA
+    rescaled_noise = noisy_next_obs * c_in[:, None, None, None]
+
+    model_out_tt, oh, ow = inner_model_forward(
+        rescaled_noise.to(torch.bfloat16), c_noise,
+        rescaled_obs.to(torch.bfloat16), act,
+        sd, device, batch, num_actions, conv_config, compute_config)
+
+    model_out = ttnn.to_torch(model_out_tt)
+    ttnn.deallocate(model_out_tt)
+
+    model_out = model_out.reshape(batch, oh, ow, -1)[:, :, :, :IMG_CH]
+    model_out = model_out.permute(0, 3, 1, 2).float()
+
+    d = c_skip[:, None, None, None] * noisy_next_obs + c_out[:, None, None, None] * model_out
+    d = d.clamp(-1, 1).add(1).div(2).mul(255).byte().float().div(255).mul(2).sub(1)
+    return d.to(torch.bfloat16)
+
+
+def sample_next_frame(prev_obs, prev_act, sd, device, num_actions,
+                      conv_config, compute_config):
+    b = prev_obs.shape[0]
+    sigmas = build_sigmas()
+    s_in = torch.ones(b)
+
+    x = torch.randn(b, IMG_CH, IMG_SIZE, IMG_SIZE).to(torch.bfloat16)
+    obs_flat = prev_obs.reshape(b, -1, IMG_SIZE, IMG_SIZE).float()
+
+    for i in range(len(sigmas) - 1):
+        t0 = time.time()
+        sigma = sigmas[i] * s_in
+        denoised = denoise_step(x.float(), sigma, obs_flat, prev_act,
+                                 sd, device, b, num_actions,
+                                 conv_config, compute_config)
+        d = (x.float() - denoised.float()) / sigma[:, None, None, None]
+        dt = sigmas[i + 1] - sigmas[i]
+        x = (x.float() + d * dt).to(torch.bfloat16)
+        print(f"    Step {i+1}/{NUM_DENOISE_STEPS} ({(time.time()-t0)*1000:.0f}ms)", flush=True)
+
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 60)
+    print("Diamond World Model - Breakout Inference")
+    print("=" * 60)
+
+    print("\n[1/5] Loading weights...")
+    weight_path = download_weights("Breakout")
+    sd = load_denoiser_sd(weight_path)
+    num_actions = sd["inner_model.act_emb.0.weight"].shape[0]
+    print(f"  {len(sd)} params, {num_actions} actions")
+
+    print("\n[2/5] Opening device...")
+    device = ttnn.open_device(device_id=0, l1_small_size=32768)
+    print(f"  Grid: {device.compute_with_storage_grid_size()}")
+
+    conv_config = ttnn.Conv2dConfig(
+        weights_dtype=ttnn.bfloat16, shard_layout=None,
+        deallocate_activation=False, output_layout=ttnn.TILE_LAYOUT)
+    compute_config = ttnn.init_device_compute_kernel_config(
+        device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4)
+
+    print("\n[3/5] Creating Breakout frames...")
+    prev_obs = make_initial_frames()  # [1, 4, 3, 64, 64]
+    # Action 1 = "fire" in most Atari configs, 3 = "right"
+    prev_act = torch.tensor([[1, 3, 3, 1]])  # fire, right, right, fire
+    print(f"  {NUM_COND} frames, obs range: [{prev_obs.min():.2f}, {prev_obs.max():.2f}]")
+
+    # Save initial frames
+    from PIL import Image
+    for i in range(NUM_COND):
+        frame = prev_obs[0, i].add(1).div(2).clamp(0, 1).mul(255).byte()
+        frame = frame.permute(1, 2, 0).numpy()
+        Image.fromarray(frame, "RGB").save(f"/tmp/diamond_init_{i}.png")
+    print(f"  Saved initial frames to /tmp/diamond_init_*.png")
+
+    print(f"\n[4/5] Generating frames (autoregressive, {NUM_DENOISE_STEPS} denoise steps each)...")
+    B = 1
+    NUM_GEN_FRAMES = 8
+    all_frames = [prev_obs[0, i] for i in range(NUM_COND)]  # collect all frames
+    obs_buffer = prev_obs.clone()
+    act_buffer = prev_act.clone()
+
+    for frame_idx in range(NUM_GEN_FRAMES):
+        t0 = time.time()
+        print(f"\n  Frame {frame_idx + 1}/{NUM_GEN_FRAMES}:", flush=True)
+
+        next_frame = sample_next_frame(obs_buffer, act_buffer, sd, device,
+                                        num_actions, conv_config, compute_config)
+
+        # Shift obs buffer: drop oldest, append new
+        obs_buffer = torch.cat([obs_buffer[:, 1:], next_frame.float().unsqueeze(1)], dim=1)
+        # Shift act buffer with a new action (alternate fire/right)
+        new_act = torch.tensor([[3 if frame_idx % 2 == 0 else 1]])
+        act_buffer = torch.cat([act_buffer[:, 1:], new_act], dim=1)
+
+        all_frames.append(next_frame[0].float())
+        elapsed = time.time() - t0
+        print(f"    Total: {elapsed*1000:.0f}ms, range: [{next_frame.min():.2f}, {next_frame.max():.2f}]")
+
+    print(f"\n[5/5] Saving frames...")
+    for i, frame in enumerate(all_frames):
+        img = frame.add(1).div(2).clamp(0, 1).mul(255).byte()
+        img = img.permute(1, 2, 0).cpu().numpy()
+        Image.fromarray(img, "RGB").save(f"/tmp/diamond_frame_{i:02d}.png")
+    print(f"  Saved {len(all_frames)} frames to /tmp/diamond_frame_*.png")
+
+    print("\n" + "=" * 60)
+    print("Done!")
+    print("=" * 60)
+    ttnn.close_device(device)
+
+
+if __name__ == "__main__":
+    main()
