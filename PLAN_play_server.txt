@@ -1,0 +1,215 @@
+Plan: Diamond World Model Play Server
+======================================
+
+Goal: HTTP server with browser UI that lets you pick an Atari game from a
+dropdown, loads weights + initial frames, runs the diffusion world model, and
+lets you play via keyboard -- all over plain HTTP (no websockets).
+
+Reference impl: ../oasis-ttlang/play_server.py + play.py
+  - File-based IPC between generator and server
+  - Polling-based frame delivery (GET /frame)
+  - Action posting (POST /action)
+  - Embedded HTML/JS client with key grid UI
+
+
+Architecture
+------------
+
+Two files, mirroring oasis-ttlang:
+
+  1. play_server.py  -- HTTP server, serves UI, proxies frames/actions
+  2. play.py         -- Model runner, reads actions, writes frames
+
+They communicate via files in /tmp/:
+  /tmp/diamond_action.json      server -> generator   {"action": int}
+  /tmp/diamond_live_frame.bmp   generator -> server   current frame (BMP)
+  /tmp/diamond_status.json      generator -> server   {"frame_index": N, "fps": F}
+  /tmp/diamond_game.json        server -> generator   {"game": "Breakout"} (game switch signal)
+
+All writes are atomic: write to .tmp, then rename.
+
+
+File 1: play_server.py
+-----------------------
+
+Endpoints:
+
+  GET /
+    Returns embedded HTML page (see UI section below).
+
+  GET /games
+    Returns JSON list of the 26 game names. Server reads this from
+    results/data/ directory (whatever subdirs exist with initial_frames.pt).
+
+  GET /frame?t=<cache_bust>
+    Reads /tmp/diamond_live_frame.bmp, returns it as image/bmp.
+    Response headers: X-Frame-Index, X-FPS, X-Frame-Mtime.
+    Returns 404 if no frame file yet.
+
+  POST /action
+    Body: {"action": int}
+    Writes to /tmp/diamond_action.json atomically.
+    Returns {"ok": true}.
+
+  POST /select_game
+    Body: {"game": "Breakout"}
+    Writes to /tmp/diamond_game.json atomically.
+    Returns {"ok": true}.
+    Generator watches this file for changes and reloads.
+
+  GET /keymap?game=<GameName>
+    Returns JSON keymap for the selected game. Derived from
+    src/game/keymap.py logic: look up {Game}NoFrameskip-v4 action
+    meanings, filter ATARI_KEYMAP to only valid actions, return as
+    {key_name: action_index, ...} plus action_names list.
+    This lets the JS client reconfigure controls per game.
+
+Embedded HTML/JS client (see UI section).
+
+
+File 2: play.py
+---------------
+
+Startup:
+  1. Parse args (--device-id, --port for status, etc.)
+  2. Eagerly download all 26 game weights from HuggingFace. Loop over
+     ATARI_100K_GAMES and call hf_hub_download for each. This ensures
+     all weights are cached locally before any game is selected, so
+     game switching is fast (no network wait). Log progress as each
+     game's weights are verified/downloaded.
+  3. Open TT device.
+  4. Wait for game selection signal (or default to Breakout).
+
+Game load sequence (called on startup and on game switch):
+  1. Download weights from HF: hf_hub_download("eloialonso/diamond",
+     f"atari_100k/models/{game}.pt")
+  2. Load denoiser state dict (same as diamond_play.py load_denoiser_sd).
+  3. Load initial frames from results/data/{game}/initial_frames.pt [1,4,3,64,64]
+     and initial_actions from results/data/{game}/initial_actions.pt [1,4].
+  4. Read num_actions from weight shape.
+  5. Initialize obs_buffer and act_buffer from loaded tensors.
+  6. Clear all weight caches (_conv_weight_cache, _gn_cache, etc.).
+  7. Run warmup pass (populates caches, compiles ops).
+  8. Optionally capture trace for fast replay.
+
+Main loop (runs continuously):
+  1. Check /tmp/diamond_game.json -- if game changed, run game load sequence.
+  2. Read /tmp/diamond_action.json -- get action int (default 0 = noop).
+  3. Call sample_next_frame(obs_buffer, act_buffer, ...) to generate next frame.
+     This is the existing diffusion sampling loop from diamond_play.py.
+  4. Shift obs_buffer: drop oldest frame, append new frame.
+  5. Shift act_buffer: drop oldest action, append current action.
+  6. Convert frame to BMP, write atomically to /tmp/diamond_live_frame.bmp.
+  7. Write status (frame_index, fps) to /tmp/diamond_status.json.
+
+The model internals (UNet, conditioning, denoising loop, trace capture) are
+opaque to this plan -- the implementor can lift them from diamond_play.py as-is.
+The key contract is: given obs_buffer [1,4,3,64,64] + act_buffer [1,4] + action
+int, produce the next frame [1,3,64,64].
+
+
+UI (embedded in play_server.py)
+-------------------------------
+
+Single HTML page, all inline JS/CSS. Layout:
+
+  +--------------------------------------------------+
+  |  Diamond World Model Player                      |
+  |                                                  |
+  |  Game: [____Breakout____v]   FPS: 3.2  Frame: 47|
+  |                                                  |
+  |  +--------------------------------------------+ |
+  |  |                                            | |
+  |  |            640x640 game frame              | |
+  |  |          (nearest-neighbor upscale)        | |
+  |  |                                            | |
+  |  +--------------------------------------------+ |
+  |                                                  |
+  |  Controls:                                       |
+  |       [W]              SPACE = fire              |
+  |    [A][S][D]           WASD  = directions        |
+  |                                                  |
+  |  Active action: right                            |
+  +--------------------------------------------------+
+
+Behavior:
+
+  Dropdown (game selector):
+    - On page load, fetch GET /games to populate options.
+    - On change, POST /select_game with {"game": name}.
+    - Then GET /keymap?game=name to reconfigure local key bindings.
+    - Display "Loading..." until frames start arriving again.
+
+  Frame polling:
+    - setInterval at ~30ms, GET /frame?t=Date.now()
+    - On success, set <img>.src to blob URL of response.
+    - Read X-FPS and X-Frame-Index from headers, update the FPS
+      display in the HUD (e.g. "FPS: 3.2").
+    - On 404, show "Waiting for frames..." overlay.
+
+  Action sending:
+    - Track pressed keys in a Set.
+    - On keydown/keyup, map pressed keys to Atari action index using
+      the keymap fetched from /keymap. Use the same priority logic as
+      Game.run(): longer key combos match first (e.g. W+SPACE = upfire
+      beats W = up or SPACE = fire individually).
+    - POST /action with {"action": action_index}.
+    - Throttle: only send when input state changes, use dirty flag +
+      pending flag like oasis-ttlang to coalesce rapid events.
+    - Update the "Current action" label in the HUD on every input
+      change (e.g. "Current action: rightfire").
+
+  Key grid visualization (like oasis-ttlang):
+    - Show WASD + SPACE as styled HTML button elements in a grid.
+    - On keydown, highlight the corresponding button (e.g. bright
+      background color) so the user can see what the server is
+      receiving. On keyup, remove the highlight.
+    - Show current resolved action name below the key grid
+      (e.g. "noop", "fire", "upleft"). This updates live as
+      keys are pressed/released.
+
+  Keymap reconfiguration:
+    - /keymap returns per-game action list and key->action mapping.
+    - JS rebuilds its local KEY_TO_ACTION map on game switch.
+    - Some games have fewer actions (e.g. Pong: noop/fire/up/down).
+      Only show relevant keys in the grid.
+
+
+Keymap endpoint detail
+----------------------
+
+The server needs to replicate the logic from src/game/keymap.py without
+importing the full src dependency chain. Approach:
+
+  - Inline the ATARI_KEYMAP and ATARI_ACTION_NAMES constants.
+  - For a given game, call gymnasium.make(f"{game}NoFrameskip-v4") to get
+    action_meanings, then filter the keymap (same as get_keymap_and_action_names).
+  - Map pygame key constants to browser key names:
+      pygame.K_w -> "w", pygame.K_a -> "a", etc.
+      pygame.K_SPACE -> " " (or "Space")
+  - Return JSON: {"actions": ["noop","fire","up",...],
+                   "keymap": {"Space": 1, "w": 2, ...},
+                   "combos": [{"keys":["w","Space"], "action": 10}, ...]}
+
+  Cache this per game so we only create the env once.
+
+
+Startup / running
+-----------------
+
+Terminal 1:  python play.py          (runs model, writes frames)
+Terminal 2:  python play_server.py   (serves HTTP on :8000)
+Browser:     http://localhost:8000
+
+
+Notes
+-----
+
+- BMP not PNG for frame writes -- faster, no compression overhead.
+- Frame size is 64x64 native, upscaled to 640x640 in browser via CSS
+  image-rendering: pixelated.
+- The action space is just an int (0..N), not a 25-element vector like oasis.
+  This simplifies the protocol.
+- Game switching is the main addition vs oasis-ttlang. It requires clearing
+  model caches and reloading weights, which takes a few seconds. The UI should
+  show a loading state during this.
