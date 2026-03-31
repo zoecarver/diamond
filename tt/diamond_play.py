@@ -14,7 +14,7 @@ import ttnn
 import numpy as np
 
 sys.path.insert(0, "/tmp")
-from kernels import groupnorm_2g, adaln_silu_kernel
+from kernels import groupnorm_2g
 
 # ---------------------------------------------------------------------------
 # Config
@@ -216,50 +216,43 @@ def tt_group_norm(x, num_groups, device):
 _adaln_params = {}  # prefix -> (scale_buf, shift_buf), allocated once on device
 
 def precompute_adaln_params(cond_host, sd, device):
-    """Compute all AdaGroupNorm scale/shift on host, write to fixed device buffers.
-
-    Scale/shift stored as [TILE, C] with values broadcast across rows,
-    matching the layout expected by adaln_gn_silu_2g.
-    """
+    """Compute all AdaGroupNorm scale/shift on host, write to fixed device buffers."""
     for key in sd:
         if not key.endswith(".norm1.linear.weight") and not key.endswith(".norm2.linear.weight"):
             continue
         prefix = key.rsplit(".weight", 1)[0]
         scale_shift = F.linear(cond_host, sd[f"{prefix}.weight"], sd[f"{prefix}.bias"])
         scale, shift = scale_shift.chunk(2, dim=-1)
-        # [1, C] -> [TILE, C] broadcast across rows for TT-Lang kernel
-        C = scale.shape[1]
-        scale_2d = scale[0].to(torch.bfloat16).unsqueeze(0).expand(TILE, C).contiguous()
-        shift_2d = shift[0].to(torch.bfloat16).unsqueeze(0).expand(TILE, C).contiguous()
-        scale_host = ttnn.from_torch(scale_2d, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        shift_host = ttnn.from_torch(shift_2d, ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        scale_host = ttnn.from_torch(
+            scale.unsqueeze(1).unsqueeze(1).to(torch.bfloat16), ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT)
+        shift_host = ttnn.from_torch(
+            shift.unsqueeze(1).unsqueeze(1).to(torch.bfloat16), ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT)
 
         if prefix not in _adaln_params:
-            scale_buf = ttnn.from_torch(scale_2d, ttnn.bfloat16,
-                                        layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
-            shift_buf = ttnn.from_torch(shift_2d, ttnn.bfloat16,
-                                        layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
+            # First call: allocate device buffers
+            scale_buf = tt_dev(scale.unsqueeze(1).unsqueeze(1).to(torch.bfloat16), device)
+            shift_buf = tt_dev(shift.unsqueeze(1).unsqueeze(1).to(torch.bfloat16), device)
             _adaln_params[prefix] = (scale_buf, shift_buf)
         else:
+            # Subsequent calls: update in place (no allocation)
             scale_buf, shift_buf = _adaln_params[prefix]
             ttnn.copy_host_to_device_tensor(scale_host, scale_buf)
             ttnn.copy_host_to_device_tensor(shift_host, shift_buf)
 
 
-def ada_group_norm_silu(x, adaln_prefix, num_groups, device):
-    """AdaGroupNorm + SiLU: groupnorm (single core) then fused modulate+silu (multi-core)."""
+def ada_group_norm(x, adaln_prefix, num_groups, device):
+    """AdaGroupNorm using pre-computed scale/shift from _adaln_params."""
     normed = tt_group_norm(x, num_groups, device)
     scale_tt, shift_tt = _adaln_params[adaln_prefix]
-    shape = normed.shape
-    hw = shape[2] if len(shape) == 4 else shape[0]
-    channels = shape[3] if len(shape) == 4 else shape[1]
-    normed_2d = ttnn.reshape(normed, [hw, channels])
-    out_2d = ttnn.from_torch(
-        torch.zeros(hw, channels, dtype=torch.bfloat16),
-        ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
-    adaln_silu_kernel(normed_2d, shift_tt, scale_tt, out_2d)
+    one_plus_scale = ttnn.add(scale_tt, 1.0)
+    modulated = ttnn.multiply(normed, one_plus_scale)
+    out = ttnn.add(modulated, shift_tt)
     ttnn.deallocate(normed)
-    return ttnn.reshape(out_2d, shape)
+    ttnn.deallocate(one_plus_scale)
+    ttnn.deallocate(modulated)
+    return out
 
 
 def resblock(x, sd, prefix, device, in_ch, out_ch, batch, h, w,
@@ -276,14 +269,16 @@ def resblock(x, sd, prefix, device, in_ch, out_ch, batch, h, w,
     else:
         r = x
 
-    h1 = ada_group_norm_silu(x, f"{prefix}.norm1.linear", ng_in, device)
+    h1 = ada_group_norm(x, f"{prefix}.norm1.linear", ng_in, device)
+    h1 = ttnn.silu(h1)
     h1, _, _ = tt_conv2d(h1, device, in_ch, out_ch,
                           batch, h, w, conv_config=conv_config,
                           compute_config=compute_config,
                           cache_key=f"{prefix}.conv1", sd=sd)
 
-    h2 = ada_group_norm_silu(h1, f"{prefix}.norm2.linear", ng_out, device)
+    h2 = ada_group_norm(h1, f"{prefix}.norm2.linear", ng_out, device)
     ttnn.deallocate(h1)
+    h2 = ttnn.silu(h2)
     h2, _, _ = tt_conv2d(h2, device, out_ch, out_ch,
                           batch, h, w, conv_config=conv_config,
                           compute_config=compute_config,
@@ -410,24 +405,16 @@ def prepare_input_and_run(noisy_next_obs, c_noise, obs, act, sd, device,
                           input_buf=None, trace_id=None):
     """Host-side prep (conditioning, adaln, input copy) + device forward.
     If trace_id is set, replays trace instead of running ops."""
-    _t0 = time.time()
     cond_host = compute_conditioning(c_noise, act, sd, num_actions)
-    _t1 = time.time()
     precompute_adaln_params(cond_host, sd, device)
-    _t2 = time.time()
 
     cat_input = torch.cat((obs, noisy_next_obs), dim=1)
     cat_nhwc = cat_input.permute(0, 2, 3, 1).contiguous().to(torch.bfloat16)
     cat_host = ttnn.from_torch(cat_nhwc, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
-    _t3 = time.time()
 
     if trace_id is not None:
         ttnn.copy_host_to_device_tensor(cat_host, input_buf)
-        _t4 = time.time()
         ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
-        _ms = lambda a, b: f"{(b-a)*1000:.1f}"
-        print(f"      prep: cond={_ms(_t0,_t1)}ms adaln={_ms(_t1,_t2)}ms "
-              f"input={_ms(_t2,_t3)}ms copy={_ms(_t3,_t4)}ms", flush=True)
     else:
         x_host = tt_host(cat_nhwc)
         return model_device_forward(x_host, sd, device, batch, conv_config, compute_config)
@@ -451,7 +438,6 @@ def sample_next_frame(prev_obs, prev_act, sd, device, num_actions,
         sigma = sigmas[i]
         c_in, c_out, c_skip, c_noise = compute_conditioners(sigma.unsqueeze(0))
         rescaled_noise = (x_host.float() * c_in[:, None, None, None]).to(torch.bfloat16)
-        t_host_prep = time.time()
 
         if trace_id is not None:
             prepare_input_and_run(
@@ -464,9 +450,6 @@ def sample_next_frame(prev_obs, prev_act, sd, device, num_actions,
             model_out_tt, oh, ow = prepare_input_and_run(
                 rescaled_noise, c_noise, rescaled_obs, prev_act,
                 sd, device, b, num_actions, conv_config, compute_config)
-
-        ttnn.synchronize_device(device)
-        t_unet = time.time()
 
         # Precondition on device
         x_nhwc = x_host.permute(0, 2, 3, 1).contiguous().reshape(1, 1, oh * ow, IMG_CH)
@@ -499,11 +482,7 @@ def sample_next_frame(prev_obs, prev_act, sd, device, num_actions,
             x_host = x_raw.reshape(b, oh, ow, -1)[:, :, :, :IMG_CH].permute(0, 3, 1, 2).to(torch.bfloat16)
 
         ttnn.synchronize_device(device)
-        t_end = time.time()
-        ms = lambda a, b: f"{(b-a)*1000:.1f}ms"
-        print(f"    Step {i+1}/{NUM_DENOISE_STEPS} ({ms(t0, t_end)}) "
-              f"[host_prep={ms(t0, t_host_prep)} cond+adaln+trace={ms(t_host_prep, t_unet)} "
-              f"precond+euler+readback={ms(t_unet, t_end)}]", flush=True)
+        print(f"    Step {i+1}/{NUM_DENOISE_STEPS} ({(time.time()-t0)*1000:.0f}ms)", flush=True)
 
     return x_host
 
