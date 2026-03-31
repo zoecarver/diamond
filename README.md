@@ -8,28 +8,48 @@ UNet-based diffusion denoiser. 4-level encoder/decoder, channels [64,64,64,64], 
 
 ## Performance
 
-~120ms per frame (3x 40ms denoise steps) on a single Blackhole chip after warmup, without tracing.
+| Mode | Per-frame | FPS | Notes |
+|------|-----------|-----|-------|
+| No caching | ~67ms | ~14 | Current default. Fresh GN output buffer each call. |
+| With GN output caching + tracing | ~57ms (3x ~19ms) | ~17 | Produces noisy output due to GN buffer reuse bug. Under investigation. |
 
 ## Kernels
 
 | Operation | Backend | Notes |
 |-----------|---------|-------|
 | GroupNorm | TT-Lang | 3-pass kernel (mean, variance, normalize). Replaces ttnn.group_norm which crashes at small spatial sizes. |
-| SiLU, Add, Mul, AdaLN modulate, Precondition, Euler step | TT-Lang | Fused elementwise kernels with grid="auto" streaming. |
-| Conv2d, Upsample, Concat | TTNN | Standard ops. |
-| Conditioning (Fourier features, embeddings, MLP) | PyTorch CPU | |
+| SiLU, Add, Mul, AdaLN modulate, Precondition, Euler step | TT-Lang | Fused elementwise kernels with grid="auto" streaming. Not yet wired into the main inference path. |
+| Conv2d, SiLU, Add, Mul, Upsample, Concat, Clip | TTNN | Standard ops. |
+| Conditioning (Fourier features, embeddings, MLP) | PyTorch CPU | Small, runs once per denoise step. |
+| AdaLN modulate, Precondition, Euler step | TTNN | On-device scalar ops. |
 
 ## How to run
 
 Requires a Tenstorrent device accessible via the [tt-connect-remote-device](https://docs.tenstorrent.com) scripts.
 
-```bash
-# Copy TT-Lang kernels to remote (only needed once or after edits)
-scripts/copy-file.sh tt/kernels.py
+### Batch mode (generate 8 frames)
 
-# Generate 8 autoregressive Breakout frames
+```bash
 scripts/run-test.sh --hw tt/diamond_play.py
 ```
+
+### Interactive mode (browser UI)
+
+Run on the remote in two terminals:
+
+```bash
+# Terminal 1: model generator
+python3 /tmp/play.py
+
+# Terminal 2: HTTP server
+python3 /tmp/play_server.py
+```
+
+Forward port 8000 to your local machine and open http://localhost:8000. The browser UI provides a game dropdown (26 Atari games), keyboard controls (WASD + Space), and live frame display.
+
+![Interactive play server](tt/doc/play_server.png)
+
+Initial frame data must be present at `/tmp/diamond_data/{Game}/initial_frames.pt` and `initial_actions.pt` on the remote. Generate locally with `scripts/generate_initial_frames.py`, then copy with the provided tarball workflow.
 
 Weights are downloaded automatically from `eloialonso/diamond` on HuggingFace.
 
@@ -37,10 +57,10 @@ Weights are downloaded automatically from `eloialonso/diamond` on HuggingFace.
 
 | File | Description |
 |------|-------------|
-| `tt/diamond_play.py` | End-to-end inference: creates Breakout frames, runs diffusion loop, saves PNGs |
-| `tt/diamond_tt.py` | Core model: UNet forward pass, denoiser, sampling |
-| `tt/kernels.py` | TT-Lang fused kernels (GroupNorm, SiLU, AdaLN, etc.) |
-| `tt/groupnorm_kernel.py` | Standalone GroupNorm kernel + test |
+| `tt/diamond_play.py` | Batch inference: creates Breakout frames, runs diffusion loop, saves PNGs |
+| `tt/play.py` | Interactive generator: reads actions, writes frames via file IPC |
+| `tt/play_server.py` | HTTP server with embedded browser UI for interactive play |
+| `tt/kernels.py` | TT-Lang fused kernels (GroupNorm) |
 | `tt/test_pcc_triage.py` | Layer-by-layer PCC comparison vs PyTorch reference |
 
 ## Output
