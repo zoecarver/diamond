@@ -198,12 +198,11 @@ def tt_group_norm(x, num_groups, device):
         mean_scale = ttnn.from_torch(
             torch.full((TILE, TILE), 1.0 / N, dtype=torch.bfloat16),
             ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=L1)
-        out_2d = ttnn.from_torch(
-            torch.zeros(hw, channels, dtype=torch.bfloat16),
-            ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
-        _gn_cache[cache_key] = (scaler, mean_scale, out_2d)
+        _gn_cache[cache_key] = (scaler, mean_scale)
 
-    scaler, mean_scale, out_2d = _gn_cache[cache_key]
+    scaler, mean_scale = _gn_cache[cache_key]
+    out_2d = ttnn.from_torch(torch.zeros(hw, channels, dtype=torch.bfloat16),
+                             ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=DRAM)
     groupnorm_2g(x_2d, scaler, mean_scale, out_2d)
     return ttnn.reshape(out_2d, shape)
 
@@ -536,27 +535,7 @@ def main():
     print(f"  Cached {len(_conv_weight_cache)} conv weights, {len(_gn_cache)} GN helpers, "
           f"{len(_norm_out_cache)} norm_out params")
 
-    # --- Capture trace of model_device_forward ---
-    print(f"\n[5/7] Capturing trace...")
-    # Pre-allocate persistent input buffer on DRAM
-    dummy_input = torch.randn(B, IMG_SIZE, IMG_SIZE, 15, dtype=torch.bfloat16)
-    input_buf = ttnn.from_torch(dummy_input, ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
-                                 device=device, memory_config=DRAM)
-    # Pre-populate adaln params for trace capture
-    sigmas = build_sigmas()
-    c_in, c_out, c_skip, c_noise = compute_conditioners(sigmas[0].unsqueeze(0))
-    cond_host = compute_conditioning(c_noise, prev_act, sd, num_actions)
-    precompute_adaln_params(cond_host, sd, device)
-
-    # Capture: pure device ops from conv_in through conv_out
-    trace_id = ttnn.begin_trace_capture(device, cq_id=0)
-    output_buf, _, _ = model_device_forward(
-        input_buf, sd, device, B, conv_config, compute_config)
-    ttnn.end_trace_capture(device, trace_id, cq_id=0)
-    ttnn.synchronize_device(device)
-    print(f"  Trace captured (id={trace_id})")
-
-    print(f"\n[6/7] Generating frames (traced, autoregressive, {NUM_DENOISE_STEPS} denoise steps each)...")
+    print(f"\n[5/6] Generating frames (no trace, {NUM_DENOISE_STEPS} denoise steps each)...")
     NUM_GEN_FRAMES = 8
     all_frames = [prev_obs[0, i] for i in range(NUM_COND)]
     obs_buffer = prev_obs.clone()
@@ -567,9 +546,7 @@ def main():
         print(f"\n  Frame {frame_idx + 1}/{NUM_GEN_FRAMES}:", flush=True)
 
         next_frame = sample_next_frame(obs_buffer, act_buffer, sd, device,
-                                        num_actions, conv_config, compute_config,
-                                        trace_id=trace_id, input_buf=input_buf,
-                                        output_buf=output_buf)
+                                        num_actions, conv_config, compute_config)
 
         # Shift obs buffer: drop oldest, append new
         obs_buffer = torch.cat([obs_buffer[:, 1:], next_frame.float().unsqueeze(1)], dim=1)
@@ -581,7 +558,7 @@ def main():
         elapsed = time.time() - t0
         print(f"    Total: {elapsed*1000:.0f}ms, range: [{next_frame.min():.2f}, {next_frame.max():.2f}]")
 
-    print(f"\n[7/7] Saving frames...")
+    print(f"\n[6/6] Saving frames...")
     for i, frame in enumerate(all_frames):
         img = frame.add(1).div(2).clamp(0, 1).mul(255).byte()
         img = img.permute(1, 2, 0).cpu().numpy()
